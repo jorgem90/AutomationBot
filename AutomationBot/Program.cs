@@ -16,13 +16,12 @@ namespace AutomationBot
             string botToken = "";
             int port = 12345;
 #endif
-            var bot = new BotService(botToken);
-            await bot.StartAsync();
-            var messageService = new MessageService(port, bot);
-
+            var messageService = new MessageService(port);
             using var cts = new CancellationTokenSource();
+            messageService.StartTcpServer(cts.Token);
 
-            await messageService.StartAsync(cts.Token);
+            var bot = new BotService(botToken, messageService);
+            await bot.StartAsync();
 
             String? message;
             Console.WriteLine("Bot is running. Type 'exit' to exit.");

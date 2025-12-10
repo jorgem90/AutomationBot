@@ -1,4 +1,5 @@
-﻿using AutomationBot.TaskManager;
+﻿using AutomationBot.Models;
+using AutomationBot.TaskManager;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -12,39 +13,42 @@ using Telegram.Bot.Types.ReplyMarkups;
 
 public class BotService
 {
-    private readonly ITelegramBotClient botClient;
-    private readonly CancellationTokenSource cts;
-    private readonly TaskManager taskManager;
+    private readonly ITelegramBotClient _botClient;
+    private readonly CancellationTokenSource _cts;
+    private readonly TaskManager _taskManager;
+    private readonly MessageService _messageService;
 
     private readonly long[] allowedIDs = new long[2] { -5067979828, 7722464240 };
 
-    public BotService(string token)
+    public BotService(string token, MessageService service)
     {
-        cts = new CancellationTokenSource();
-        botClient = new TelegramBotClient(token, cancellationToken: cts.Token);
-        taskManager = new TaskManager();
+        _cts = new CancellationTokenSource();
+        _botClient = new TelegramBotClient(token, cancellationToken: _cts.Token);
+        _taskManager = new TaskManager();
+        _messageService = service;
+        service.OnMessageReceived += HandleExternalMessage;
     }
 
     public async Task StartAsync()
     {
-        var me = await botClient.GetMe();
+        var me = await _botClient.GetMe();
         Console.WriteLine($"Bot {me.FirstName} started.");
         ReceiverOptions receiverOptions = new()
         {
             AllowedUpdates = Array.Empty<Telegram.Bot.Types.Enums.UpdateType>()
         };
 
-        botClient.StartReceiving(
+        _botClient.StartReceiving(
             updateHandler: HandleUpdate,
             errorHandler: HandleError,
             receiverOptions: receiverOptions,
-            cancellationToken: cts.Token
+            cancellationToken: _cts.Token
         );
     }
 
     public async Task StopAsync()
     {
-        cts.Cancel();
+        _cts.Cancel();
         await Task.Delay(500);
         Console.WriteLine("Bot stopped.");
     }
@@ -94,21 +98,12 @@ public class BotService
                         new[]
                         {
                             InlineKeyboardButton.WithCallbackData("🔄 Restart router", "restart_router"),
-                            InlineKeyboardButton.WithCallbackData("⌛ Restart status", "restart_status"),
+                            InlineKeyboardButton.WithCallbackData("🚀 Start speedtest", "speed_test_start"),
                         },
                         new[]
                         {
-                            InlineKeyboardButton.WithCallbackData("📖 Last restart", "restart_last_time"),
-                            InlineKeyboardButton.WithCallbackData("🔎 Recent Results", "speed_test_results_recent"),
-                        },
-                        new[]
-                        {
-                            InlineKeyboardButton.WithCallbackData("📝 Speed Report", "speed_test_results_recent"),
-                            InlineKeyboardButton.WithCallbackData("📊 Speed Graph", "speed_test_results_recent"),
-                        },
-                        new[]
-                        {
-                            InlineKeyboardButton.WithCallbackData("⌯⌲ Send message", "send_message"),
+                            InlineKeyboardButton.WithCallbackData("📝 Speed Report", "speed_test_results_report"),
+                            InlineKeyboardButton.WithCallbackData("📊 Speed Graph", "speed_test_results_graph"),
                         }
                     });
 
@@ -125,25 +120,41 @@ public class BotService
     {
         switch (callbackQuery.Data)
         {
-            case "send_message":
-                await botClient.EditMessageText(
+            case "speed_test_results_report":
+            case "speed_test_start":
+                await _botClient.EditMessageText(
                     chatId: callbackQuery.Message.Chat.Id,
                     messageId: callbackQuery.Message.Id,
-                    text: taskManager.RouterRestartStatus(),
-                    cancellationToken: cancellationToken
-                    );
+                    text: "Loading data..."
+                );
+                await _messageService.BroadcastMessageAsync(new TCPMessage
+                {
+                    type = "text",
+                    title = callbackQuery.Data,
+                    chatId= callbackQuery.Message.Chat.Id,
+                    messageId= callbackQuery.Message.Id,
+                });
+                break;
+            case "speed_test_results_graph":
+                await _messageService.BroadcastMessageAsync(new TCPMessage
+                {
+                    type = "text",
+                    title = callbackQuery.Data,
+                    chatId = callbackQuery.Message.Chat.Id,
+                    messageId = callbackQuery.Message.Id,
+                });
                 break;
             case "restart_status":
                 await botClient.EditMessageText(
                     chatId: callbackQuery.Message.Chat.Id,
                     messageId: callbackQuery.Message.Id,
-                    text: taskManager.RouterRestartStatus(),
+                    text: _taskManager.RouterRestartStatus(),
                     cancellationToken: cancellationToken
                     );
                 break;
             case "restart_router":
-                await taskManager.ExecuteRouterRestartNowAsync();
-                taskManager.CancelRouterRestart();
+                await _taskManager.ExecuteRouterRestartNowAsync();
+                _taskManager.CancelRouterRestart();
                 await botClient.EditMessageText(
                     chatId: callbackQuery.Message.Chat.Id,
                     messageId: callbackQuery.Message.Id,
@@ -151,7 +162,7 @@ public class BotService
                 );
                 break;
             case "cancel_restart_router":
-                taskManager.CancelRouterRestart();
+                _taskManager.CancelRouterRestart();
                 await botClient.EditMessageText(
                     chatId: callbackQuery.Message.Chat.Id,
                     messageId: callbackQuery.Message.Id,
@@ -178,7 +189,7 @@ public class BotService
                 break;
             case var s when s.StartsWith("delay_restart_router_"):
                 var seconds = int.Parse(s.Split('_').Last()) * 60;
-                taskManager.ScheduleRouterRestart(seconds);
+                _taskManager.ScheduleRouterRestart(seconds);
                 await botClient.EditMessageText(
                     chatId: callbackQuery.Message.Chat.Id,
                     messageId: callbackQuery.Message.Id,
@@ -193,20 +204,44 @@ public class BotService
 
     }
 
-    public async Task HandleExternalMessage(string message)
+    public async void HandleExternalMessage(TCPMessage message)
     {
-        switch(message.ToLower())            
+        if (message is null) return;
+
+        switch(message.title.ToLower())            
         {
             case "slow_internet":
-                taskManager.ScheduleRouterRestart(60 * 5);
-                await HandleSlowInternetMessage();
+                await HandleSlowInternetMessage(message.content);
+                break;
+            case "speed_test_results_report":
+            case "speed_test_start":
+                await _botClient.EditMessageText(
+                    chatId: message.chatId,
+                    messageId: message.messageId,
+                    text: message.content
+                );
+                break;
+            case "speed_test_results_graph":
+                byte[] bytes = Convert.FromBase64String(message.content);
+                using (MemoryStream ms = new MemoryStream(bytes))
+                {
+                    await _botClient.DeleteMessage(
+                        chatId: message.chatId,
+                        messageId: message.messageId
+                       );
+                    await _botClient.SendPhoto(
+                        chatId: message.chatId,
+                        photo: InputFile.FromStream(ms)
+                       );
+                }
+
                 break;
             default:
                 break;
         };
     }
 
-    public async Task HandleSlowInternetMessage()
+    public async Task HandleSlowInternetMessage(string message)
     {
         InlineKeyboardMarkup inlineKeyboard = new(new[]
         {
@@ -218,17 +253,36 @@ public class BotService
             }
         });
 
-        await botClient.SendMessage(
-            chatId: allowedIDs[0],
-            text: "Slow internet detected. Router will be restarted in 5 minutes unless action is taken.",
-            replyMarkup: inlineKeyboard
-        );
+        var now = DateTime.Now;
+        if (now.DayOfWeek >= DayOfWeek.Monday && now.DayOfWeek <= DayOfWeek.Friday && now.Hour >= 9 && now.Hour <= 18)
+        {
+
+            _taskManager.ScheduleRouterRestart(60 * 30);
+            await _botClient.SendMessage(
+                chatId: allowedIDs[0],
+                text: "Slow internet detected. Router will be restarted in 30 minutes unless action is taken.",
+                replyMarkup: inlineKeyboard
+            );
+        }
+        else
+        {
+
+            _taskManager.ScheduleRouterRestart(60 * 5);
+            await _botClient.SendMessage(
+                chatId: allowedIDs[0],
+                text: "Slow internet detected. Router will be restarted in 5 minutes unless action is taken.",
+                replyMarkup: inlineKeyboard
+            );
+        }
+
+
+
     }
 
     public async Task SendMessage(string message)
     {
-        await botClient.SendMessage(
-            chatId: -5067979828,
+        await _botClient.SendMessage(
+            chatId: allowedIDs[0],
             text: message
         );
     }

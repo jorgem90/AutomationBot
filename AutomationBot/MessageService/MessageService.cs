@@ -1,21 +1,34 @@
-﻿using System;
+﻿using AutomationBot.Models;
+using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
+using Telegram.Bot.Types;
 
-internal class MessageService
+
+public class MessageService
 {
     private static int _port;
-    private static BotService _bot;
     private TcpListener _listener;
+    private readonly ConcurrentDictionary<Guid, TcpClient> _clients = new();
 
-    public MessageService(int port, BotService bot)
+    public event Action<TCPMessage> OnMessageReceived;
+
+
+    public MessageService(int port)
     {
         _port = port;
-        _bot = bot;
+    }
+
+    public void StartTcpServer(CancellationToken token)
+    {
+        Task.Run(() => StartAsync(token));
     }
 
     public async Task StartAsync(CancellationToken token)
@@ -27,6 +40,7 @@ internal class MessageService
             while (!token.IsCancellationRequested)
             {
                 var client = await _listener.AcceptTcpClientAsync(token);
+                _clients[Guid.NewGuid()] = client;
                 _ = HandleClientAsync(client, token);
             }
         }
@@ -44,12 +58,73 @@ internal class MessageService
         using (client)
         {
             var stream = client.GetStream();
-            using var reader = new StreamReader(stream, Encoding.UTF8);
-            string message = await reader.ReadToEndAsync();
-            if(string.IsNullOrWhiteSpace(message))
-                return;
-            await _bot.HandleExternalMessage(message);
+            var message = await ReceiveMessageAsync(stream);
+            OnMessageReceived.Invoke(message);
         }
     }
+
+    private async Task<TCPMessage> ReceiveMessageAsync(NetworkStream stream)
+    {
+        try
+        {
+            byte[] lengthBuffer = new byte[4];
+            int bytesRead = await stream.ReadAsync(lengthBuffer, 0, 4);
+            if (bytesRead == 0)
+                return null;
+
+            if (BitConverter.IsLittleEndian)
+                Array.Reverse(lengthBuffer);
+            int messageLength = BitConverter.ToInt32(lengthBuffer, 0);
+
+            byte[] messageBuffer = new byte[messageLength];
+            int totalRead = 0;
+            while (totalRead < messageLength)
+            {
+                bytesRead = await stream.ReadAsync(
+                    messageBuffer,
+                    totalRead,
+                    messageLength - totalRead
+                );
+                if (bytesRead == 0)
+                    return null;
+                totalRead += bytesRead;
+            }
+
+            string json = Encoding.UTF8.GetString(messageBuffer);
+            return JsonSerializer.Deserialize<TCPMessage>(json);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error receiving message: {ex.Message}");
+            return null;
+        }
+    }
+
+    public async Task SendMessage(NetworkStream stream, TCPMessage message)
+    {
+        string json = JsonSerializer.Serialize(message);
+        byte[] data = Encoding.UTF8.GetBytes(json);
+
+        byte[] lengthPrefix = BitConverter.GetBytes(data.Length);
+        if (BitConverter.IsLittleEndian)
+            Array.Reverse(lengthPrefix);
+
+        await stream.WriteAsync(lengthPrefix, 0, 4);
+        await stream.WriteAsync(data, 0, data.Length);
+        await stream.FlushAsync();
+    }
+
+    public async Task BroadcastMessageAsync(TCPMessage message)
+    {
+        foreach (var client in _clients.Values)
+        {
+            if (client.Connected)
+            {
+                var stream = client.GetStream();
+                await SendMessage(stream, message);
+            }
+        }
+    }
+
 }
 
